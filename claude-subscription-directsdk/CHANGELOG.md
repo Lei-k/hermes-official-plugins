@@ -7,6 +7,7 @@
 - Fable 5.2 (`claude-fable-5-2[1m]`, 1M), released November 9, 2026; the `fable` alias moves to it (pin `claude-fable-5-1` to keep Fable 5.1). It needs Claude Code 2.1.321 or newer. Thinking stays mandatory, and the usage-credits note follows Anthropic's plan rule as for Fable 5 and 5.1. Mythos 5.2 (`claude-mythos-5-2[1m]`, 1M) is pinned as access-gated like Mythos 5.1.
 - Mythos 5.1 (`claude-mythos-5-1[1m]`, 1M) for organizations Anthropic has verified. It is listed only when the account's own picker offers it, never from the pinned catalog, so accounts without access do not see it. Reasoning-off requests ask for the lowest effort instead of a disable Mythos rejects.
 - Per-profile `claude_config_dir` setting selects the Claude login for every native spawn in a multiplexed gateway (#34).
+- Each request records which prompt-cache tier its writes landed in: the API's `usage.cache_creation` split (5-minute and 1-hour writes) goes into the response usage as `native_cache_tiers` and one INFO line, `DirectSDK cache tiers requested_ttl=… write_5m=… write_1h=…` (`unknown` when native does not report a counter, or the call fails before usage). `requested_ttl` is native's `CLAUDE_CODE_PROMPT_CACHE_TTL` (`5m`/`1h`, else `unknown`). The first request per client whose writes land in the opposite tier also logs a warning. Telemetry is best-effort and logs counts only: a broken logging sink never replaces the answer or the original error, nor skips process and relay cleanup.
 
 ### Changed
 
