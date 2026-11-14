@@ -160,6 +160,11 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
 
 
 def classify_api_error(error, **_):
+    # A non-Claude id refused before native started (directsdk.ClaudeModelNotFound; matched by name, as the
+    # loader's package import and the flat import are distinct classes): no retry can serve it, fall back now.
+    if type(error).__name__ == 'ClaudeModelNotFound':
+        return {'reason': 'model_not_found', 'retryable': False, 'should_fallback': True}
+
     # Hermes' stale-call watchdog stops a hung call through Client.cancel(), so its kill comes back as our cancel
     # error, which Hermes would retry as unknown: classify it as the timeout it is. A user interrupt never arrives
     # as this error; Hermes marks its request cancelled first, drops ours and raises InterruptedError.

@@ -28,13 +28,13 @@ from types import SimpleNamespace
 
 try:
     from .admission import Admission
-    from .model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
+    from .model_catalog import accepts_thinking_disable, names_claude, native_model, supports_adaptive_thinking
     from .directsdk_setup import (
         INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_traffic_policy,
         drop_api_credentials)
 except ImportError:
     from admission import Admission
-    from model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
+    from model_catalog import accepts_thinking_disable, names_claude, native_model, supports_adaptive_thinking
     from directsdk_setup import (
         INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_traffic_policy,
         drop_api_credentials)
@@ -63,6 +63,20 @@ class ClaudeAPIError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.request_id = request_id
+
+
+class ClaudeModelNotFound(ClaudeAPIError):
+    """A model id that names no Claude model (a `gpt-*` or `gemini-*` left over from another provider).
+
+    Raised before any native start: Claude Code would spend a spawn and an upstream round trip only to
+    404. The 404 status and the `Model not found` text are what Hermes core already reads as
+    non-retryable `model_not_found`; the profile hook classifies the type too, so fallback does not
+    depend on the core's text patterns.
+    """
+
+    def __init__(self, model):
+        super().__init__(f'Model not found for provider claude-subscription-directsdk-experimental: {model!r}; '
+                         'expected a Claude model id or alias', 404)
 
 
 # Native's own error codes for errors it answers without a relayed upstream status.
@@ -763,6 +777,8 @@ class Client:
             system, frames = prepare_history(kwargs.get('messages', []), names)
             if not isinstance(kwargs.get('model'), str) or not kwargs['model']:
                 raise ValueError('model is required')
+            if not names_claude(kwargs['model']):
+                raise ClaudeModelNotFound(kwargs['model'])
         except BaseException:
             with self._lock:
                 self._requests.discard(request)
