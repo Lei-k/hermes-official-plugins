@@ -254,6 +254,73 @@ def stable_request_context(payload, queried):
         return payload
 
 
+# Native's environment message names its cwd, then, on the very next line, whether that cwd is in a
+# git repository. Only that exact layout is recognised; any other spelling forwards unchanged.
+_ENV_HEAD = '# Environment\nYou have been invoked in the following environment: \n - Primary working directory: '
+_GIT_LINE = '\n - Is a git repository: {}\n'
+_workdir_git = {}
+_workdir_git_lock = threading.Lock()
+
+
+def _git_answer(workdir):
+    """The git line's value for the plugin's own workdir, computed once per workdir and then fixed.
+
+    The workdir is plugin-owned scratch: it is a repository only if a ``.git`` sits in it."""
+    with _workdir_git_lock:
+        if workdir not in _workdir_git:
+            _workdir_git[workdir] = 'true' if os.path.lexists(os.path.join(workdir, '.git')) else 'false'
+        return _workdir_git[workdir]
+
+
+def stable_workdir_git(payload, workdir):
+    """Pin native's ``Is a git repository`` line for the plugin's own workdir.
+
+    Native answers that line with a fresh walk from its cwd up to ``/`` for any ``.git``, so an
+    unrelated ``.git`` that appears above the shared scratch workdir (another tool running
+    ``git init`` in the same temp tree) flipped it for just those requests. The environment
+    message sits right after the first user turn, so each flip, and the flip back, re-wrote the
+    whole conversation to the prompt cache. The line for ``workdir`` (canonical, as native's
+    getcwd() reports it) is set to one value computed once for that workdir.
+
+    Only that exact line, right after the exact workdir path, inside ``system``-role messages
+    (native's own; host content never arrives in that role) is touched; everything else stays
+    byte-identical. Another path, a worktree variant (a line between the two) or an unknown
+    layout forwards unchanged. Whether native should name its scratch directory here at all is
+    issue #385; this only keeps the line stable."""
+    if not workdir or b'Is a git repository: ' not in payload:
+        return payload
+    try:
+        body = json.loads(payload)
+        messages = body['messages']
+        if not isinstance(messages, list):
+            return payload
+        answer = _git_answer(workdir)
+        pinned = _ENV_HEAD + workdir + _GIT_LINE.format(answer)
+        stale = _ENV_HEAD + workdir + _GIT_LINE.format('false' if answer == 'true' else 'true')
+        changed = False
+
+        def pin(text):
+            nonlocal changed
+            if isinstance(text, str) and stale in text:
+                changed = True
+                return text.replace(stale, pinned)
+            return text
+
+        for message in messages:
+            if not isinstance(message, dict) or message.get('role') != 'system':
+                continue
+            content = message.get('content')
+            if isinstance(content, str):
+                message['content'] = pin(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get('type') == 'text' and 'text' in block:
+                        block['text'] = pin(block['text'])
+        return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8') if changed else payload
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return payload
+
+
 def _opens_turn(message):
     """A user message carrying anything but tool results: a new turn, or a /steer row after them."""
     content = message.get('content')
@@ -671,9 +738,11 @@ class _Server(HTTPServer):
 
 
 class Admission:
-    def __init__(self, upstream, timeout, queried=None):
+    def __init__(self, upstream, timeout, queried=None, workdir=None):
         self.upstream = urlsplit(upstream)
         self.queried = queried
+        # Native's canonical cwd: the relay pins that directory's git line (stable_workdir_git).
+        self.workdir = workdir
         host = self.upstream.hostname
         try:
             local = ipaddress.ip_address(host).is_loopback
@@ -842,6 +911,7 @@ class Handler(BaseHTTPRequestHandler):
                 # reshapes its tool results degrades to an uncached tail, never a failed turn.
                 gate.unrestored = str(exc)
             payload = stable_request_context(payload, gate.queried)
+            payload = stable_workdir_git(payload, getattr(gate, 'workdir', None))
             payload = pin_message_breakpoint(payload, gate.queried)
             payload = stream_tool_input(payload)
             target = gate.upstream
