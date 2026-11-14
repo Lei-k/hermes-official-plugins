@@ -162,6 +162,108 @@ def _frame_first(messages, queried):
     return True
 
 
+# Claude Code's account-email reminder, exactly as native writes it: the bare 2.1.280 form, the
+# 2.1.283 usage sentence and IMPORTANT paragraph, and the 2.1.296 attribution paragraph. One
+# template only, never arbitrary reminders or email text: any other wording stays in the request.
+_ACCOUNT_REMINDER = re.compile(
+    r"<system-reminder>\nAs you answer the user's questions, you can use the "
+    r"following context:\n# userEmail\nThe user's email address is "
+    r"[^\s<>@]+@[^\s<>@]+\."
+    r"(?: Use it only to identify the user, such as for authorship, attribution, or filtering "
+    r"their own work\. Never send it to an unrelated service, such as in a request header, "
+    r"URL, or payload, unless the user explicitly asks\.)?"
+    r"(?:\n\nIMPORTANT: this context may or may not be relevant to your tasks\. You should "
+    r"not respond to this context unless it is highly relevant to your task\.)?"
+    r"(?:\n\nClaude Code attached this context automatically; it isn't part of the user's "
+    r"message\. It describes the user's own account and workspace, so they don't need it "
+    r"reported back\.)?"
+    r"\n</system-reminder>\n?")
+
+
+def _account_block(block, marked=True):
+    """A text block that is exactly native's account reminder (a cache marker allowed if ``marked``)."""
+    return (isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)
+            and set(block) <= ({'type', 'text', 'cache_control'} if marked else {'type', 'text'})
+            and _ACCOUNT_REMINDER.fullmatch(block['text']) is not None)
+
+
+def _without_account(sent, host):
+    """``sent`` with native's account reminder suffix removed, or None unless that is the only difference."""
+    if _plain(sent) == _plain(host):
+        return sent
+    if not isinstance(sent, dict) or not isinstance(host, dict):
+        return None
+    kind = host.get('type')
+    field = 'text' if kind == 'text' else 'content' if kind == 'tool_result' else None
+    if field is None or field not in sent or field not in host:
+        return None
+    left, right = _plain(sent), _plain(host)
+    actual, expected = left.pop(field), right.pop(field)
+    if left != right:
+        return None
+    if isinstance(actual, str) and isinstance(expected, str):
+        suffix = actual[len(expected):] if actual.startswith(expected) else ''
+        if not any(suffix.startswith(sep) and _ACCOUNT_REMINDER.fullmatch(suffix[len(sep):])
+                   for sep in ('\n\n', '\n')):
+            return None
+        restored = expected
+    elif kind == 'tool_result' and isinstance(actual, list) and isinstance(expected, list):
+        if len(actual) not in (len(expected), len(expected) + 1):
+            return None
+        restored = [_without_account(a, b) for a, b in zip(actual, expected)]
+        if any(b is None for b in restored):
+            return None
+        if len(actual) > len(expected) and not _account_block(actual[-1], marked=False):
+            return None
+    else:
+        return None
+    result = copy.deepcopy(sent)
+    result[field] = restored
+    return result
+
+
+def _drop_account_suffix(messages, queried):
+    """Send the newest user turn without the account reminder native appends after Hermes' frame.
+
+    Native adds its account-email reminder to the turn it answers: prepended on the opening and
+    ordinary user turns (dropped by ``_frame_first`` and ``stable_request_context``), but appended
+    after the frame on others: as a suffix of the frame's last text, inside a tool_result's
+    content, or as its own block after the frame. Later requests replay the turn without it, so
+    the text never recurs, keeps the message breakpoint off the replayed prefix, and reads to
+    Claude as part of the user's message (#195).
+
+    Only text that is exactly the known template goes, and only when the whole queried frame
+    reconciles with the turn at one position; host text that merely contains an email, unknown
+    reminder wording, and anything before the frame stay as native built them. A cache marker on
+    a dropped standalone block moves onto the frame's last block with setdefault, never
+    multiplying. Returns whether the turn changed."""
+    last = max((i for i, m in enumerate(messages) if m.get('role') == 'assistant'), default=-1)
+    newest = messages[last + 1] if last + 1 < len(messages) else {}
+    content = newest.get('content')
+    if newest.get('role') != 'user' or not isinstance(content, list) or len(content) < len(queried):
+        return False
+    matches = []
+    for start in range(len(content) - len(queried) + 1):
+        restored = [_without_account(a, b) for a, b in zip(content[start:], queried)]
+        if all(b is not None for b in restored):
+            matches.append((start, restored))
+    if len(matches) != 1:
+        return False
+    start, restored = matches[0]
+    end = start + len(queried)
+    after = content[end:]
+    mark = None
+    if len(after) == 1 and _account_block(after[0]):
+        mark, after = after[0].get('cache_control'), []
+    normalized = content[:start] + restored + after
+    if normalized == content:
+        return False
+    if mark is not None:
+        restored[-1].setdefault('cache_control', mark)
+    content[:] = normalized
+    return True
+
+
 # The only trailing system text the relay moves: native 2.1.299's date line, exactly as its opening request ends the
 # environment message. Any other trailing text stays put, since moving text that varies per request into the
 # environment message would change the prefix from message 1 on every request.
@@ -340,13 +442,15 @@ def pin_message_breakpoint(payload, queried):
     system and messages; system and tools marks are never touched, and a moved or added
     marker keeps native's own order of TTLs.
     The breakpoint never moves later, content changes only where ``_frame_first`` drops native's
-    context from the opening request, and any payload that does not parse forwards as is."""
+    context from the opening request or ``_drop_account_suffix`` drops the account reminder
+    native appends after the frame, and any payload that does not parse forwards as is."""
     if not queried:
         return payload
     try:
         body = json.loads(payload)
         messages = body['messages']
-        reordered = _frame_first(messages, queried)
+        reordered = _drop_account_suffix(messages, queried)
+        reordered = _frame_first(messages, queried) or reordered
         blocks = [(i, j, b) for i, m in enumerate(messages) if isinstance(m.get('content'), list)
                   for j, b in enumerate(m['content'])]
         marked = [(i, j, b) for i, j, b in blocks if isinstance(b, dict) and 'cache_control' in b]
