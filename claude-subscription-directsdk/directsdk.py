@@ -820,6 +820,12 @@ class Client:
                 apply_traffic_policy(env)
                 # Hermes owns budgets; native's replayed reminder invalidates cached history.
                 env['CLAUDE_CODE_TOTAL_TOKENS_REMINDER'] = 'off'
+                # One prompt-cache TTL policy for main, delegated and cron queries. FORCE_PROMPT_CACHING_5M has
+                # higher native precedence than either TTL variable, so it is dropped.
+                ttl = env.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_CACHE_TTL', '1h')
+                ttl = ttl if ttl in ('1h', '5m') else '1h'
+                env.pop('FORCE_PROMPT_CACHING_5M', None)
+                env.update(CLAUDE_CODE_PROMPT_CACHE_TTL=ttl, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=ttl)
                 # Hermes owns memory and instructions. --setting-sources '' leaves auto memory and the managed
                 # CLAUDE.md loading, and native would put them in the conversation as a reminder on the user's
                 # turn, where Claude reads Claude Code's notes as text smuggled into the user's message (#195).
