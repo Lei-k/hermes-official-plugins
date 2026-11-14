@@ -110,6 +110,43 @@ def _repairs_onto_offered(name, offered):
 CARRIER = 'claude-subscription-directsdk-experimental.native_assistant'
 PREFIX = 'mcp__hermes__'
 
+logger = logging.getLogger(__name__)
+CACHE_TIERS = ('5m', '1h')
+
+
+def native_cache_tiers(usage, requested_ttl):
+    """The API's prompt-cache write split for one request. A missing or malformed counter stays None
+    (logged as unknown); arbitrary native values never reach the log."""
+    tiers = {'requested_ttl': requested_ttl, 'write_5m': None, 'write_1h': None}
+    creation = usage.get('cache_creation') if isinstance(usage, dict) else None
+    if isinstance(creation, dict):
+        for tier in CACHE_TIERS:
+            count = creation.get(f'ephemeral_{tier}_input_tokens')
+            tiers[f'write_{tier}'] = count if type(count) is int and count >= 0 else None
+    return tiers
+
+
+def _requested_cache_ttl(env):
+    """The TTL native was asked for; anything but a known tier is reported as unknown, never echoed."""
+    ttl = env.get('CLAUDE_CODE_PROMPT_CACHE_TTL')
+    return ttl if ttl in CACHE_TIERS else 'unknown'
+
+
+def _cache_tiers(usage, requested_ttl):
+    # Telemetry is best-effort: it must never replace the provider result or the original error.
+    try:
+        return native_cache_tiers(usage, requested_ttl)
+    except Exception:
+        return {'requested_ttl': requested_ttl, 'write_5m': None, 'write_1h': None}
+
+
+def _cache_log(level, message, *args):
+    """A broken logging sink must not change a request's result, its error or its cleanup."""
+    try:
+        logger.log(level, message, *args)
+    except Exception:
+        pass  # Reporting this through the same logger could fail again.
+
 
 class Object(SimpleNamespace):
     def model_dump(self, **_):
@@ -728,7 +765,23 @@ class Client:
         self.command = ([command] if isinstance(command, str) else list(command)) + list(args or [])
         self.timeout = timeout if isinstance(timeout, (int, float)) else 180
         self._lock, self._requests, self._closed = threading.Lock(), set(), False
+        self._cache_mismatch_warned = False
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def _log_cache_tiers(self, tiers):
+        """One INFO line per request; one warning per client when writes land in the other tier."""
+        try:
+            ttl, five, hour = tiers['requested_ttl'], tiers['write_5m'], tiers['write_1h']
+            counts = (ttl, 'unknown' if five is None else five, 'unknown' if hour is None else hour)
+            _cache_log(logging.INFO, 'DirectSDK cache tiers requested_ttl=%s write_5m=%s write_1h=%s', *counts)
+            opposite = {'1h': five, '5m': hour}.get(ttl)
+            if opposite:
+                with self._lock:
+                    warn, self._cache_mismatch_warned = not self._cache_mismatch_warned, True
+                if warn:
+                    _cache_log(logging.WARNING, 'DirectSDK cache tier mismatch requested_ttl=%s write_5m=%s write_1h=%s', *counts)
+        except Exception:
+            pass
 
     def cancel(self):
         """Fast cross-thread cancellation: signal owned groups; never close caller-thread FDs."""
@@ -816,6 +869,7 @@ class Client:
         reader = None
         err_drain = None
         native_stderr = deque(maxlen=40)
+        cache_tiers = None
         try:
             timeout = kwargs.get('timeout', self.timeout)
             timeout = getattr(timeout, 'read', timeout)
@@ -858,6 +912,9 @@ class Client:
                 ttl = ttl if ttl in ('1h', '5m') else '1h'
                 env.pop('FORCE_PROMPT_CACHING_5M', None)
                 env.update(CLAUDE_CODE_PROMPT_CACHE_TTL=ttl, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=ttl)
+                # Recorded per request once native's env is final; a call failing before usage reports unknown tiers.
+                requested_ttl = _requested_cache_ttl(env)
+                cache_tiers = _cache_tiers({}, requested_ttl)
                 # Hermes owns memory and instructions. --setting-sources '' leaves auto memory and the managed
                 # CLAUDE.md loading, and native would put them in the conversation as a reminder on the user's
                 # turn, where Claude reads Claude Code's notes as text smuggled into the user's message (#195).
@@ -1096,6 +1153,7 @@ class Client:
                 usage = assistants[0]['usage'] if admission.used else final.get('usage')
                 if not isinstance(usage, dict) or not all(isinstance(usage.get(k), (int, float)) for k in ('input_tokens', 'output_tokens')):
                     raise RuntimeError('Native result missing complete token usage')
+                cache_tiers = _cache_tiers(usage, requested_ttl)
                 text = ''.join(b.get('text', '') for b in blocks if b.get('type') == 'text')
                 if emitted != text:
                     if text.startswith(emitted):
@@ -1130,6 +1188,7 @@ class Client:
                 normalized_usage['native_admission'] = {'upstream_requests': int(admission.used), 'blocked_requests': admission.denied, 'request_id': admission.request_id}
                 if admission.unrestored:
                     normalized_usage['native_admission']['unrestored'] = admission.unrestored
+                normalized_usage['native_cache_tiers'] = dict(cache_tiers)
                 finish = 'content_filter' if refused else 'tool_calls' if calls else ('length' if any(a.get('stop_reason') in ('max_tokens', 'model_context_window_exceeded') for a in assistants) else 'stop')
                 response = obj({'id': assistants[-1].get('id', 'claude-native'), 'model': kwargs['model'], 'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}], 'usage': normalized_usage})
                 chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': [carrier], **({'refusal': message['refusal']} if refused else {})}, finish, normalized_usage)
@@ -1155,6 +1214,9 @@ class Client:
                             pass
             with self._lock:
                 self._requests.discard(request)
+            # After cleanup, so a broken logging sink can never skip it.
+            if cache_tiers is not None:
+                self._log_cache_tiers(cache_tiers)
 
     @staticmethod
     def _chunk(model, delta, finish=None, usage=None):
