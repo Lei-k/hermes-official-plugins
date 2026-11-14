@@ -21,6 +21,7 @@ USAGE_LINE = "u={'input_tokens':3,'output_tokens':5,'cache_read_input_tokens':7,
 assert USAGE_LINE in FAKE
 TIERED = FAKE.replace(USAGE_LINE, USAGE_LINE + "if 'CACHE_CREATION' in os.environ:\n u['cache_creation']=json.loads(os.environ['CACHE_CREATION'])\n")
 TTL = 'CLAUDE_CODE_PROMPT_CACHE_TTL'
+POLICY_TTL = 'CLAUDE_SUBSCRIPTION_DIRECTSDK_CACHE_TTL'
 SECRET = 'unsafe-value@example.invalid'
 INFO = 'DirectSDK cache tiers requested_ttl=%s write_5m=%s write_1h=%s'
 MISMATCH = 'DirectSDK cache tier mismatch requested_ttl=%s write_5m=%s write_1h=%s'
@@ -90,14 +91,37 @@ def test_tiers_reach_usage_and_one_info_line(tmp_path, caplog, streaming, creati
 
 
 @pytest.mark.parametrize('value,requested', [(None, 'unknown'), ('1h', '1h'), ('5m', '5m'), (SECRET, 'unknown'), ('', 'unknown')])
-def test_requested_ttl_comes_from_native_env(tmp_path, caplog, value, requested):
-    env = {'CACHE_CREATION': json.dumps({'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 0})}
-    if value is not None:
-        env[TTL] = value
-    native = client(tmp_path, **env)
+def test_requested_ttl_helper_sanitizes_raw_native_env(value, requested):
+    env = {} if value is None else {TTL: value}
+    assert directsdk._requested_cache_ttl(env) == requested
+
+
+@pytest.mark.parametrize('policy,inherited,requested', [
+    (None, None, '1h'),
+    (None, '5m', '1h'),
+    ('1h', '5m', '1h'),
+    ('5m', '1h', '5m'),
+    (SECRET, '5m', '1h'),
+    ('', '5m', '1h'),
+    (None, SECRET, '1h'),
+    (None, '', '1h'),
+])
+def test_requested_ttl_matches_policy_and_actual_native_env(tmp_path, caplog, policy, inherited, requested):
+    record = tmp_path / 'ttl.json'
+    fake = TIERED.replace('rows=[]', "pathlib.Path(os.environ['TTL_RECORD']).write_text(json.dumps({k: os.environ.get(k) for k in ('CLAUDE_CODE_PROMPT_CACHE_TTL', 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL', 'FORCE_PROMPT_CACHING_5M')}))\nrows=[]")
+    env = {'CACHE_CREATION': json.dumps({'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 0}),
+           'TTL_RECORD': str(record), 'FORCE_PROMPT_CACHING_5M': '1'}
+    if policy is not None:
+        env[POLICY_TTL] = policy
+    if inherited is not None:
+        env[TTL] = inherited
+    native = client(tmp_path, fake=fake, **env)
     try:
         with caplog.at_level(logging.INFO, logger=directsdk.logger.name):
             result = native.create(**request())
+        assert json.loads(record.read_text()) == {
+            TTL: requested, 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL': requested,
+            'FORCE_PROMPT_CACHING_5M': None}
         assert result.usage.model_dump()['native_cache_tiers']['requested_ttl'] == requested
         assert records(caplog, 'INFO') == [INFO % (requested, 0, 0)]
         assert SECRET not in caplog.text
@@ -110,7 +134,7 @@ def test_requested_ttl_comes_from_native_env(tmp_path, caplog, value, requested)
     ('5m', {'ephemeral_5m_input_tokens': 3, 'ephemeral_1h_input_tokens': 8}),
 ])
 def test_opposite_tier_warns_once_per_client(tmp_path, caplog, requested, creation):
-    env = {TTL: requested, 'CACHE_CREATION': json.dumps(creation)}
+    env = {POLICY_TTL: requested, 'CACHE_CREATION': json.dumps(creation)}
     native = client(tmp_path, **env)
     try:
         with caplog.at_level(logging.INFO, logger=directsdk.logger.name):
@@ -132,8 +156,8 @@ def test_opposite_tier_warns_once_per_client(tmp_path, caplog, requested, creati
 
 @pytest.mark.parametrize('env', [
     {TTL: '1h', 'CACHE_CREATION': json.dumps({'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 8})},
-    {TTL: '5m', 'CACHE_CREATION': json.dumps({'ephemeral_5m_input_tokens': 8, 'ephemeral_1h_input_tokens': 0})},
-    {'CACHE_CREATION': json.dumps({'ephemeral_5m_input_tokens': 3, 'ephemeral_1h_input_tokens': 8})},
+    {POLICY_TTL: '5m', 'CACHE_CREATION': json.dumps({'ephemeral_5m_input_tokens': 8, 'ephemeral_1h_input_tokens': 0})},
+    {'CACHE_CREATION': json.dumps({'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 8})},
     {TTL: '1h'},
 ])
 def test_no_warning_without_an_opposite_tier_write(tmp_path, caplog, env):
