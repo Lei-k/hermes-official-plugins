@@ -9,6 +9,7 @@ from contextlib import suppress
 import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -73,6 +74,37 @@ NATIVE_ERROR_STATUS = {
     'overloaded': 529,
     'server_error': 503,  # native's code for capacity, 5xx and OAuth-refresh races: transient
 }
+
+
+class ClaudeToolOutsideInventory(ClaudeAPIError):
+    """Native named a tool this request did not offer exactly once (unknown, or claimed by two offered names).
+
+    Never handed to Hermes: its turn validation repairs an unknown name onto an offered tool by
+    normalization or fuzzy match, which would run a different tool with these arguments. The
+    provider profile classifies this as a non-retryable request error; a configured fallback
+    still applies. The message names the tool only, never its arguments."""
+    failure_kind = 'tool_outside_inventory'
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _warn(message, *args):
+    """Name-only tool diagnostics; a broken log sink never changes the request outcome."""
+    try:
+        _logger.warning(message, *args)
+    except Exception:
+        pass
+
+
+def _repairs_onto_offered(name, offered):
+    """True when Hermes' tool-name repair would turn ``name`` into one of ``offered`` (or cannot be asked)."""
+    try:
+        from types import SimpleNamespace
+        from agent.agent_runtime_helpers import repair_tool_call
+        return repair_tool_call(SimpleNamespace(valid_tool_names=set(offered)), name) is not None
+    except Exception:
+        return True  # unknown host behaviour: stay closed
 
 
 CARRIER = 'claude-subscription-directsdk-experimental.native_assistant'
@@ -1021,15 +1053,36 @@ class Client:
                 calls = []
                 for block in blocks:
                     if block.get('type') == 'tool_use':
-                        # Native built-ins are off (--tools '', inert MCP, dontAsk), so any other name is
-                        # the model's, e.g. a Tool Search-deferred tool called directly (#39). Hermes owns
-                        # validation and answers an unknown name with a recoverable error.
-                        if block['name'] in hermes_names:
-                            # Native sometimes drops the prefix on a tool it was offered (#62); carry the
-                            # offered name so replayed history does not teach the slip back to the model.
-                            block['name'] = PREFIX + block['name']
-                        name = block['name'].removeprefix(PREFIX)
-                        name = hermes_names.get(name, name)
+                        # Hermes gets only a name that is exactly one offered tool. Its turn validation repairs any
+                        # other name onto an offered tool (normalization, then a 0.7 fuzzy match) and dispatches it
+                        # with these arguments, so an unknown or ambiguous name fails closed here instead.
+                        native_name = block['name']
+                        offered = set()
+                        if native_name.startswith(PREFIX) and native_name[len(PREFIX):] in hermes_names:
+                            offered.add(hermes_names[native_name[len(PREFIX):]])  # the route native was offered
+                        if native_name in hermes_names:
+                            offered.add(hermes_names[native_name])  # an offered name with the prefix dropped (#62)
+                        if not offered:
+                            # Outside the inventory (#39, e.g. a tool this agent was not given): hand it to Hermes,
+                            # which answers with a recoverable error, unless its name repair would land it on an
+                            # offered tool and run that tool with these arguments. Only that case fails closed.
+                            bare = native_name.removeprefix(PREFIX)
+                            if not _repairs_onto_offered(bare, set(hermes_names.values())):
+                                _warn('DirectSDK native tool call outside the offered inventory: %r; handed to Hermes', native_name[:80])
+                                calls.append({'id': block['id'], 'type': 'function', 'function': {'name': bare, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
+                                continue
+                        if len(offered) != 1:
+                            shown = native_name[:80]
+                            # Name only, never arguments: they may carry user data.
+                            _warn('DirectSDK native tool call %s: %r; failing closed',
+                                       'matches two offered tools' if offered else 'outside the offered inventory', shown)
+                            raise ClaudeToolOutsideInventory(
+                                f'Native returned an ambiguous tool name: {shown!r} matches two offered tools' if offered
+                                else f'Native returned a tool outside the current host inventory: {shown!r}')
+                        if native_name in hermes_names:
+                            # Carry the offered name so replayed history does not teach the slip back to the model.
+                            block['name'] = PREFIX + native_name
+                        name = offered.pop()
                         calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and (fast or proc_returncode == 1)
                 if not boundary and not native_failure_handled and ((not fast and proc_returncode != 0) or final.get('is_error') or final.get('subtype') != 'success'):
