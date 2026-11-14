@@ -919,8 +919,11 @@ class Client:
                 # CLAUDE.md loading, and native would put them in the conversation as a reminder on the user's
                 # turn, where Claude reads Claude Code's notes as text smuggled into the user's message (#195).
                 env.update(CLAUDE_CODE_DISABLE_AUTO_MEMORY='1', CLAUDE_CODE_DISABLE_CLAUDE_MDS='1')
-                # The queried frame lets the relay keep the cache breakpoint off native's per-request context.
-                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'])
+                # The queried frame lets the relay keep the cache breakpoint off native's per-request context;
+                # the workdir lets it pin native's ancestor-dependent git line for that directory. Canonical,
+                # because native reports its getcwd(): a TMPDIR reached through a symlink would never match.
+                workdir = os.path.realpath(self._workdir())
+                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'], workdir=workdir)
                 # A Hermes auxiliary one-shot (summary, title: marked by the profile hook, one turn, no tools) is
                 # never replayed, so the relay drops its message cache marks instead of moving them.
                 request.admission.one_shot = kwargs.get('hermes_auxiliary') is True and not manifest and len(frames) == 1
@@ -943,7 +946,7 @@ class Client:
                 # environment message near the top of every request, so a new session id per spawn moved the cache
                 # prefix on every call while feature flags are on.
                 command += ['--session-id', conversation_session_id(system, frames)]
-                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
+                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', cwd=workdir, env=env)
                 # Native's stderr is diagnosis, not noise: a gateway-only failure (issue #44)
                 # previously vanished into DEVNULL, and the reporter had to patch the plugin to
                 # learn the stream was empty. Drain on a thread so the child never blocks.
