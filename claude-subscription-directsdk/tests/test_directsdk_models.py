@@ -52,7 +52,7 @@ def test_native_argv_enables_only_known_long_context_models(profile, tmp_path):
                'claude-fable-5-1':'claude-fable-5-1[1m]', 'fable-5-1':'claude-fable-5-1[1m]',
                'claude-mythos-5-1':'claude-mythos-5-1[1m]', 'mythos-5.1':'claude-mythos-5-1[1m]',
                'claude-mythos-5-2':'claude-mythos-5-2[1m]', 'mythos-5.2':'claude-mythos-5-2[1m]',
-               'unqualified-future-model':'unqualified-future-model'}
+               'claude-opus-9-9':'claude-opus-9-9', 'claude-opus-9-9[1m]':'claude-opus-9-9[1m]'}
     with_client = profile.create_client(command=[sys.executable,str(native)], env={'PATH':os.defpath,'HOME':str(tmp_path),'ARGV_CAPTURE':str(capture)})
     try:
         for requested, expected in {**{m:m for m in {**EXPECTED, **GATED}}, **aliases}.items():

@@ -1,4 +1,6 @@
 """Pinned native routes; a loopback gateway needs explicit long-context selection."""
+import re
+
 CONTEXT_WINDOWS = {
     'claude-sonnet-5-5': 1_000_000,
     'claude-sonnet-5': 1_000_000,
@@ -76,6 +78,28 @@ def native_model(model):
             raise ValueError('Haiku 4.5 does not support a 1M context window')
         return canonical
     return model
+
+
+# Claude Code's own aliases outside ALIASES (`default` clears an override, `best`, `opusplan`):
+# https://code.claude.com/docs/en/model-config#model-aliases
+CLI_ALIASES = frozenset({'default', 'best', 'opusplan'})
+# Family words (`opus`, `sonnet`, `haiku`, `fable`, `mythos`), read off the pinned ids so a new family
+# pinned in CONTEXT_WINDOWS widens the guard with it.
+CLAUDE_FAMILIES = frozenset(canonical.split('-')[1] for canonical in CONTEXT_WINDOWS)
+
+
+def names_claude(model):
+    """Whether a requested id could name a Claude model, for the guard that keeps foreign ids off native.
+
+    The rule allows rather than denies, so no future Claude id is rejected: any id containing
+    `claude`, any plugin or CLI alias, any short name `_route_base` resolves (`sonnet-5-5`), and
+    any id whose first word is a Claude family. Only the guard's copy is case-folded and stripped;
+    native argv keeps the id as `native_model` spells it.
+    """
+    base = model.strip().casefold().removesuffix('[1m]')
+    return ('claude' in base or base in ALIASES or base in CLI_ALIASES
+            or _route_base(base).startswith('claude-')
+            or re.split(r'[-._/:\s\[]', base, maxsplit=1)[0] in CLAUDE_FAMILIES | CLI_ALIASES)
 
 
 def accepts_thinking_disable(model):

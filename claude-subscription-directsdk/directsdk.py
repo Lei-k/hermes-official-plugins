@@ -9,6 +9,7 @@ from contextlib import suppress
 import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -28,13 +29,13 @@ from types import SimpleNamespace
 
 try:
     from .admission import Admission
-    from .model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
+    from .model_catalog import accepts_thinking_disable, names_claude, native_model, supports_adaptive_thinking
     from .directsdk_setup import (
         INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_traffic_policy,
         drop_api_credentials)
 except ImportError:
     from admission import Admission
-    from model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
+    from model_catalog import accepts_thinking_disable, names_claude, native_model, supports_adaptive_thinking
     from directsdk_setup import (
         INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude, apply_config_dir, apply_traffic_policy,
         drop_api_credentials)
@@ -65,6 +66,20 @@ class ClaudeAPIError(RuntimeError):
         self.request_id = request_id
 
 
+class ClaudeModelNotFound(ClaudeAPIError):
+    """A model id that names no Claude model (a `gpt-*` or `gemini-*` left over from another provider).
+
+    Raised before any native start: Claude Code would spend a spawn and an upstream round trip only to
+    404. The 404 status and the `Model not found` text are what Hermes core already reads as
+    non-retryable `model_not_found`; the profile hook classifies the type too, so fallback does not
+    depend on the core's text patterns.
+    """
+
+    def __init__(self, model):
+        super().__init__(f'Model not found for provider claude-subscription-directsdk-experimental: {model!r}; '
+                         'expected a Claude model id or alias', 404)
+
+
 # Native's own error codes for errors it answers without a relayed upstream status.
 NATIVE_ERROR_STATUS = {
     'rate_limit': 429,  # plan/session limit ("You've hit your session limit")
@@ -75,8 +90,76 @@ NATIVE_ERROR_STATUS = {
 }
 
 
+class ClaudeToolOutsideInventory(ClaudeAPIError):
+    """Native named a tool this request did not offer exactly once (unknown, or claimed by two offered names).
+
+    Never handed to Hermes: its turn validation repairs an unknown name onto an offered tool by
+    normalization or fuzzy match, which would run a different tool with these arguments. The
+    provider profile classifies this as a non-retryable request error; a configured fallback
+    still applies. The message names the tool only, never its arguments."""
+    failure_kind = 'tool_outside_inventory'
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _warn(message, *args):
+    """Name-only tool diagnostics; a broken log sink never changes the request outcome."""
+    try:
+        _logger.warning(message, *args)
+    except Exception:
+        pass
+
+
+def _repairs_onto_offered(name, offered):
+    """True when Hermes' tool-name repair would turn ``name`` into one of ``offered`` (or cannot be asked)."""
+    try:
+        from types import SimpleNamespace
+        from agent.agent_runtime_helpers import repair_tool_call
+        return repair_tool_call(SimpleNamespace(valid_tool_names=set(offered)), name) is not None
+    except Exception:
+        return True  # unknown host behaviour: stay closed
+
+
 CARRIER = 'claude-subscription-directsdk-experimental.native_assistant'
 PREFIX = 'mcp__hermes__'
+
+logger = logging.getLogger(__name__)
+CACHE_TIERS = ('5m', '1h')
+
+
+def native_cache_tiers(usage, requested_ttl):
+    """The API's prompt-cache write split for one request. A missing or malformed counter stays None
+    (logged as unknown); arbitrary native values never reach the log."""
+    tiers = {'requested_ttl': requested_ttl, 'write_5m': None, 'write_1h': None}
+    creation = usage.get('cache_creation') if isinstance(usage, dict) else None
+    if isinstance(creation, dict):
+        for tier in CACHE_TIERS:
+            count = creation.get(f'ephemeral_{tier}_input_tokens')
+            tiers[f'write_{tier}'] = count if type(count) is int and count >= 0 else None
+    return tiers
+
+
+def _requested_cache_ttl(env):
+    """The TTL native was asked for; anything but a known tier is reported as unknown, never echoed."""
+    ttl = env.get('CLAUDE_CODE_PROMPT_CACHE_TTL')
+    return ttl if ttl in CACHE_TIERS else 'unknown'
+
+
+def _cache_tiers(usage, requested_ttl):
+    # Telemetry is best-effort: it must never replace the provider result or the original error.
+    try:
+        return native_cache_tiers(usage, requested_ttl)
+    except Exception:
+        return {'requested_ttl': requested_ttl, 'write_5m': None, 'write_1h': None}
+
+
+def _cache_log(level, message, *args):
+    """A broken logging sink must not change a request's result, its error or its cleanup."""
+    try:
+        logger.log(level, message, *args)
+    except Exception:
+        pass  # Reporting this through the same logger could fail again.
 
 
 class Object(SimpleNamespace):
@@ -696,7 +779,23 @@ class Client:
         self.command = ([command] if isinstance(command, str) else list(command)) + list(args or [])
         self.timeout = timeout if isinstance(timeout, (int, float)) else 180
         self._lock, self._requests, self._closed = threading.Lock(), set(), False
+        self._cache_mismatch_warned = False
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def _log_cache_tiers(self, tiers):
+        """One INFO line per request; one warning per client when writes land in the other tier."""
+        try:
+            ttl, five, hour = tiers['requested_ttl'], tiers['write_5m'], tiers['write_1h']
+            counts = (ttl, 'unknown' if five is None else five, 'unknown' if hour is None else hour)
+            _cache_log(logging.INFO, 'DirectSDK cache tiers requested_ttl=%s write_5m=%s write_1h=%s', *counts)
+            opposite = {'1h': five, '5m': hour}.get(ttl)
+            if opposite:
+                with self._lock:
+                    warn, self._cache_mismatch_warned = not self._cache_mismatch_warned, True
+                if warn:
+                    _cache_log(logging.WARNING, 'DirectSDK cache tier mismatch requested_ttl=%s write_5m=%s write_1h=%s', *counts)
+        except Exception:
+            pass
 
     def cancel(self):
         """Fast cross-thread cancellation: signal owned groups; never close caller-thread FDs."""
@@ -763,6 +862,8 @@ class Client:
             system, frames = prepare_history(kwargs.get('messages', []), names)
             if not isinstance(kwargs.get('model'), str) or not kwargs['model']:
                 raise ValueError('model is required')
+            if not names_claude(kwargs['model']):
+                raise ClaudeModelNotFound(kwargs['model'])
         except BaseException:
             with self._lock:
                 self._requests.discard(request)
@@ -784,6 +885,7 @@ class Client:
         reader = None
         err_drain = None
         native_stderr = deque(maxlen=40)
+        cache_tiers = None
         try:
             timeout = kwargs.get('timeout', self.timeout)
             timeout = getattr(timeout, 'read', timeout)
@@ -820,12 +922,24 @@ class Client:
                 apply_traffic_policy(env)
                 # Hermes owns budgets; native's replayed reminder invalidates cached history.
                 env['CLAUDE_CODE_TOTAL_TOKENS_REMINDER'] = 'off'
+                # One prompt-cache TTL policy for main, delegated and cron queries. FORCE_PROMPT_CACHING_5M has
+                # higher native precedence than either TTL variable, so it is dropped.
+                ttl = env.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_CACHE_TTL', '1h')
+                ttl = ttl if ttl in ('1h', '5m') else '1h'
+                env.pop('FORCE_PROMPT_CACHING_5M', None)
+                env.update(CLAUDE_CODE_PROMPT_CACHE_TTL=ttl, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=ttl)
+                # Recorded per request once native's env is final; a call failing before usage reports unknown tiers.
+                requested_ttl = _requested_cache_ttl(env)
+                cache_tiers = _cache_tiers({}, requested_ttl)
                 # Hermes owns memory and instructions. --setting-sources '' leaves auto memory and the managed
                 # CLAUDE.md loading, and native would put them in the conversation as a reminder on the user's
                 # turn, where Claude reads Claude Code's notes as text smuggled into the user's message (#195).
                 env.update(CLAUDE_CODE_DISABLE_AUTO_MEMORY='1', CLAUDE_CODE_DISABLE_CLAUDE_MDS='1')
-                # The queried frame lets the relay keep the cache breakpoint off native's per-request context.
-                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'])
+                # The queried frame lets the relay keep the cache breakpoint off native's per-request context;
+                # the workdir lets it pin native's ancestor-dependent git line for that directory. Canonical,
+                # because native reports its getcwd(): a TMPDIR reached through a symlink would never match.
+                workdir = os.path.realpath(self._workdir())
+                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'], workdir=workdir)
                 # A Hermes auxiliary one-shot (summary, title: marked by the profile hook, one turn, no tools) is
                 # never replayed, so the relay drops its message cache marks instead of moving them.
                 request.admission.one_shot = kwargs.get('hermes_auxiliary') is True and not manifest and len(frames) == 1
@@ -848,7 +962,7 @@ class Client:
                 # environment message near the top of every request, so a new session id per spawn moved the cache
                 # prefix on every call while feature flags are on.
                 command += ['--session-id', conversation_session_id(system, frames)]
-                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
+                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', cwd=workdir, env=env)
                 # Native's stderr is diagnosis, not noise: a gateway-only failure (issue #44)
                 # previously vanished into DEVNULL, and the reporter had to patch the plugin to
                 # learn the stream was empty. Drain on a thread so the child never blocks.
@@ -1021,15 +1135,36 @@ class Client:
                 calls = []
                 for block in blocks:
                     if block.get('type') == 'tool_use':
-                        # Native built-ins are off (--tools '', inert MCP, dontAsk), so any other name is
-                        # the model's, e.g. a Tool Search-deferred tool called directly (#39). Hermes owns
-                        # validation and answers an unknown name with a recoverable error.
-                        if block['name'] in hermes_names:
-                            # Native sometimes drops the prefix on a tool it was offered (#62); carry the
-                            # offered name so replayed history does not teach the slip back to the model.
-                            block['name'] = PREFIX + block['name']
-                        name = block['name'].removeprefix(PREFIX)
-                        name = hermes_names.get(name, name)
+                        # Hermes gets only a name that is exactly one offered tool. Its turn validation repairs any
+                        # other name onto an offered tool (normalization, then a 0.7 fuzzy match) and dispatches it
+                        # with these arguments, so an unknown or ambiguous name fails closed here instead.
+                        native_name = block['name']
+                        offered = set()
+                        if native_name.startswith(PREFIX) and native_name[len(PREFIX):] in hermes_names:
+                            offered.add(hermes_names[native_name[len(PREFIX):]])  # the route native was offered
+                        if native_name in hermes_names:
+                            offered.add(hermes_names[native_name])  # an offered name with the prefix dropped (#62)
+                        if not offered:
+                            # Outside the inventory (#39, e.g. a tool this agent was not given): hand it to Hermes,
+                            # which answers with a recoverable error, unless its name repair would land it on an
+                            # offered tool and run that tool with these arguments. Only that case fails closed.
+                            bare = native_name.removeprefix(PREFIX)
+                            if not _repairs_onto_offered(bare, set(hermes_names.values())):
+                                _warn('DirectSDK native tool call outside the offered inventory: %r; handed to Hermes', native_name[:80])
+                                calls.append({'id': block['id'], 'type': 'function', 'function': {'name': bare, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
+                                continue
+                        if len(offered) != 1:
+                            shown = native_name[:80]
+                            # Name only, never arguments: they may carry user data.
+                            _warn('DirectSDK native tool call %s: %r; failing closed',
+                                       'matches two offered tools' if offered else 'outside the offered inventory', shown)
+                            raise ClaudeToolOutsideInventory(
+                                f'Native returned an ambiguous tool name: {shown!r} matches two offered tools' if offered
+                                else f'Native returned a tool outside the current host inventory: {shown!r}')
+                        if native_name in hermes_names:
+                            # Carry the offered name so replayed history does not teach the slip back to the model.
+                            block['name'] = PREFIX + native_name
+                        name = offered.pop()
                         calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and (fast or proc_returncode == 1)
                 if not boundary and not native_failure_handled and ((not fast and proc_returncode != 0) or final.get('is_error') or final.get('subtype') != 'success'):
@@ -1037,6 +1172,7 @@ class Client:
                 usage = assistants[0]['usage'] if admission.used else final.get('usage')
                 if not isinstance(usage, dict) or not all(isinstance(usage.get(k), (int, float)) for k in ('input_tokens', 'output_tokens')):
                     raise RuntimeError('Native result missing complete token usage')
+                cache_tiers = _cache_tiers(usage, requested_ttl)
                 text = ''.join(b.get('text', '') for b in blocks if b.get('type') == 'text')
                 if emitted != text:
                     if text.startswith(emitted):
@@ -1071,6 +1207,7 @@ class Client:
                 normalized_usage['native_admission'] = {'upstream_requests': int(admission.used), 'blocked_requests': admission.denied, 'request_id': admission.request_id}
                 if admission.unrestored:
                     normalized_usage['native_admission']['unrestored'] = admission.unrestored
+                normalized_usage['native_cache_tiers'] = dict(cache_tiers)
                 finish = 'content_filter' if refused else 'tool_calls' if calls else ('length' if any(a.get('stop_reason') in ('max_tokens', 'model_context_window_exceeded') for a in assistants) else 'stop')
                 response = obj({'id': assistants[-1].get('id', 'claude-native'), 'model': kwargs['model'], 'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}], 'usage': normalized_usage})
                 chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': [carrier], **({'refusal': message['refusal']} if refused else {})}, finish, normalized_usage)
@@ -1096,6 +1233,9 @@ class Client:
                             pass
             with self._lock:
                 self._requests.discard(request)
+            # After cleanup, so a broken logging sink can never skip it.
+            if cache_tiers is not None:
+                self._log_cache_tiers(cache_tiers)
 
     @staticmethod
     def _chunk(model, delta, finish=None, usage=None):
